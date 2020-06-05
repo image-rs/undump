@@ -1,7 +1,10 @@
 [package]
 name = "image-undump"
-version = "0.0.0"
+description = "Analyze a folder containing a large quantity of images"
 authors = ["Andreas Molzer <andreas.molzer@gmx.de>"]
+license = "MIT OR Apache-2.0"
+
+version = "0.0.0"
 edition = "2018"
 
 [dependencies]
