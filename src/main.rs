@@ -1,5 +1,5 @@
 use std::io;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use tokio::fs;
@@ -21,33 +21,40 @@ fn main() {
 }
 
 async fn process_all(files: &mut dyn Iterator<Item=std::path::PathBuf>) {
-    let count: HashMap<image::ImageFormat, usize> = HashMap::new();
-    let count = RefCell::new(count);
+    let begin = std::time::SystemTime::now();
+    let stats = Stats::default();
     let stream = RefCell::new(files);
 
-    let workers: Vec<_> = (0..32)
-        .map(|_| read_files(&stream, &count))
+    let workers: Vec<_> = (0..(1 << 10))
+        .map(|_| read_files(&stream, &stats))
         .collect();
 
     let _ = futures::future::join_all(workers).await;
-    println!("Statistics {:?}", count);
+
+    if let Ok(duration) = std::time::SystemTime::now().duration_since(begin) {
+        println!("Took {} seconds", duration.as_secs_f32());
+    }
+
+    println!("Total files: {}", stats.total.get());
+    println!("Statistics {:?}", stats.count.borrow());
 }
 
 async fn read_files(
     supplier: &RefCell<&mut dyn Iterator<Item=std::path::PathBuf>>,
-    count: &RefCell<HashMap<image::ImageFormat, usize>>,
+    stats: &Stats,
 ) {
     loop {
         let next = supplier.borrow_mut().next();
         if let Some(path) = next {
-            for_file(path, count).await;
+            stats.file();
+            for_file(path, stats).await;
         } else {
             break;
         }
     }
 }
 
-async fn for_file(path: std::path::PathBuf, count: &RefCell<HashMap<image::ImageFormat, usize>>) {
+async fn for_file(path: std::path::PathBuf, count: &Stats) {
     let mut file = match fs::File::open(path).await {
         Ok(file) => file,
         Err(_) => return,
@@ -59,9 +66,15 @@ async fn for_file(path: std::path::PathBuf, count: &RefCell<HashMap<image::Image
     let reader = io::Cursor::new(buffer.as_slice());
     if let Ok(read) = image::io::Reader::new(reader).with_guessed_format() {
         if let Some(format) = read.format() {
-            *count.borrow_mut().entry(format).or_default() += 1usize;
+            count.add(format);
         }
     }
+}
+
+#[derive(Default)]
+struct Stats {
+    count: RefCell<HashMap<image::ImageFormat, usize>>,
+    total: Cell<usize>,
 }
 
 enum Mode {
@@ -108,5 +121,15 @@ impl Mode {
         let mut rt = Runtime::new().unwrap();
         let local = task::LocalSet::new();
         local.block_on(&mut rt, fut);
+    }
+}
+
+impl Stats {
+    fn add(&self, format: image::ImageFormat) {
+        *self.count.borrow_mut().entry(format).or_default() += 1;
+    }
+
+    fn file(&self) {
+        self.total.set(self.total.get() + 1);
     }
 }
