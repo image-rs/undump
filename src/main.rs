@@ -1,11 +1,17 @@
 use std::io;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 
-use tokio::fs;
-use tokio::io::AsyncReadExt;
-
+use futures::channel::mpsc;
+use futures::sink::SinkExt;
 use futures::stream::StreamExt;
+
+use image::{ImageError, ImageFormat};
+
+use tokio::{fs, task};
+use tokio::io::AsyncReadExt;
+use tokio::runtime::Runtime;
 
 fn main() {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
@@ -22,18 +28,29 @@ fn main() {
     }
 }
 
-async fn process_all(files: &mut dyn Iterator<Item=std::path::PathBuf>) {
+async fn process_all(files: &mut dyn Iterator<Item=std::path::PathBuf>, open: bool) {
     let begin = std::time::SystemTime::now();
     let stats = Stats::default();
     let stream = RefCell::new(files);
 
+    let opener = if open {
+        let (sender, receiver) = mpsc::channel(16);
+        std::thread::spawn(move || open_all(receiver));
+        Some(sender)
+    } else {
+        None
+    };
+
     let workers: Vec<_> = (0..(1 << 10))
-        .map(|_| read_files(&stream, &stats))
+        .map(|_| read_files(&stream, &stats, opener.clone()))
         .collect();
 
     let mut all = futures::stream::FuturesUnordered::new();
     all.extend(workers);
     all.collect::<()>().await;
+    if let Some(mut opener) = opener {
+        let _ = opener.flush().await;
+    }
 
     if let Ok(duration) = std::time::SystemTime::now().duration_since(begin) {
         println!("Took {} seconds", duration.as_secs_f32());
@@ -44,22 +61,27 @@ async fn process_all(files: &mut dyn Iterator<Item=std::path::PathBuf>) {
 }
 
 async fn read_files(
-    supplier: &RefCell<&mut dyn Iterator<Item=std::path::PathBuf>>,
+    supplier: &RefCell<&mut dyn Iterator<Item=PathBuf>>,
     stats: &Stats,
+    mut open: Option<mpsc::Sender<OpenWorkItem>>,
 ) {
     loop {
         let next = supplier.borrow_mut().next();
         if let Some(path) = next {
             stats.file();
-            for_file(path, stats).await;
+            for_file(path, stats, open.as_mut()).await;
         } else {
             break;
         }
     }
 }
 
-async fn for_file(path: std::path::PathBuf, count: &Stats) {
-    let mut file = match fs::File::open(path).await {
+async fn for_file(
+    path: std::path::PathBuf,
+    count: &Stats,
+    open: Option<&mut mpsc::Sender<OpenWorkItem>>,
+) {
+    let mut file = match fs::File::open(&path).await {
         Ok(file) => file,
         Err(_) => return,
     };
@@ -71,8 +93,35 @@ async fn for_file(path: std::path::PathBuf, count: &Stats) {
     if let Ok(read) = image::io::Reader::new(reader).with_guessed_format() {
         if let Some(format) = read.format() {
             count.add(format);
+            if let Some(opener) = open {
+                // Don't care about failing? Maybe we should de-init the sender.
+                let _ = opener.send(OpenWorkItem(path, format)).await;
+            }
         }
     }
+}
+
+struct OpenWorkItem(PathBuf, ImageFormat);
+
+fn open_all(from: mpsc::Receiver<OpenWorkItem>) {
+    fn open_one(OpenWorkItem(path, format): OpenWorkItem) -> Result<(), ImageError> {
+        let mut reader = image::io::Reader::open(path)?;
+        reader.set_format(format);
+        let _ = reader.decode()?;
+        Ok(())
+    }
+
+    async fn block_on_all(mut from: mpsc::Receiver<OpenWorkItem>) {
+        // Until error or exhaustion
+        while let Some(item) = from.next().await {
+            let _ = open_one(item);
+        }
+    }
+
+
+    let mut rt = Runtime::new().unwrap();
+    let local = task::LocalSet::new();
+    local.block_on(&mut rt, block_on_all(from));
 }
 
 #[derive(Default)]
@@ -88,6 +137,7 @@ struct Batched<I: Iterator> {
 
 enum Mode {
     Dir(String),
+    OpenAll(String),
     Recurse(String),
 }
 
@@ -96,6 +146,7 @@ impl Mode {
         match &*args {
             [] => Mode::Dir(path),
             [arg] if arg == "--recurse" || arg == "-r" => Mode::Recurse(path),
+            [arg] if arg == "--open-all" || arg == "-o" => Mode::OpenAll(path),
             _ => {
                 eprintln!("Call as: undump [-r] dir");
                 std::process::exit(1);
@@ -109,7 +160,7 @@ impl Mode {
                 let mut files = std::fs::read_dir(path)?
                     .filter_map(Result::ok)
                     .map(|entry| entry.path());
-                Self::spawn(process_all(&mut files));
+                Self::spawn(process_all(&mut files, false));
             }
             Self::Recurse(path) => {
                 let files = walkdir::WalkDir::new(path)
@@ -117,17 +168,22 @@ impl Mode {
                     .filter_map(Result::ok)
                     .map(|entry| entry.into_path());
                 let mut files = Batched::new(files, 1 << 12);
-                Self::spawn(process_all(&mut files));
-            },
+                Self::spawn(process_all(&mut files, false));
+            }
+            Self::OpenAll(path) => {
+                let files = walkdir::WalkDir::new(path)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.into_path());
+                let mut files = Batched::new(files, 1 << 12);
+                Self::spawn(process_all(&mut files, true));
+            }
         }
 
         Ok(())
     }
 
     fn spawn(fut: impl std::future::Future<>) {
-        use tokio::runtime::Runtime;
-        use tokio::task;
-
         let mut rt = Runtime::new().unwrap();
         let local = task::LocalSet::new();
         local.block_on(&mut rt, fut);
