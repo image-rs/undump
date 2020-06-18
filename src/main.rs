@@ -1,9 +1,11 @@
 use std::io;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+
+use futures::stream::StreamExt;
 
 fn main() {
     let mut args: Vec<_> = std::env::args().skip(1).collect();
@@ -29,7 +31,9 @@ async fn process_all(files: &mut dyn Iterator<Item=std::path::PathBuf>) {
         .map(|_| read_files(&stream, &stats))
         .collect();
 
-    let _ = futures::future::join_all(workers).await;
+    let mut all = futures::stream::FuturesUnordered::new();
+    all.extend(workers);
+    all.collect::<()>().await;
 
     if let Ok(duration) = std::time::SystemTime::now().duration_since(begin) {
         println!("Took {} seconds", duration.as_secs_f32());
@@ -77,6 +81,11 @@ struct Stats {
     total: Cell<usize>,
 }
 
+struct Batched<I: Iterator> {
+    buf: VecDeque<I::Item>,
+    iter: I,
+}
+
 enum Mode {
     Dir(String),
     Recurse(String),
@@ -103,10 +112,11 @@ impl Mode {
                 Self::spawn(process_all(&mut files));
             }
             Self::Recurse(path) => {
-                let pattern = format!("{}/**/*", path);
-                let mut files = glob::glob(&pattern)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                    .filter_map(Result::ok);
+                let files = walkdir::WalkDir::new(path)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.into_path());
+                let mut files = Batched::new(files, 1 << 12);
                 Self::spawn(process_all(&mut files));
             },
         }
@@ -131,5 +141,36 @@ impl Stats {
 
     fn file(&self) {
         self.total.set(self.total.get() + 1);
+    }
+}
+
+impl<I: Iterator> Batched<I> {
+    fn new(iter: I, nr: usize) -> Self {
+        Batched {
+            buf: VecDeque::with_capacity(nr),
+            iter,
+        }
+    }
+
+    fn reload(&mut self) {
+        let amount = self.buf.capacity() - self.buf.len();
+        self.buf.extend(self.iter.by_ref().take(amount));
+    }
+}
+
+impl<I: Iterator> Iterator for Batched<I> {
+    type Item = I::Item;
+    fn next(&mut self) -> Option<I::Item> {
+       match self.buf.pop_front() {
+           Some(item) => return Some(item),
+           None => {},
+       }
+
+       self.reload();
+
+       match self.buf.pop_front() {
+           Some(item) => Some(item),
+           None => None,
+       }
     }
 }
